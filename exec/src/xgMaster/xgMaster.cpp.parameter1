@@ -1,0 +1,155 @@
+/*
+ * @file
+ * @author  YongLi Cheng <sa_cyl@163.com>
+ * @version 1.0
+ *
+ * Copyright [2014] [YongLI Cheng / HuaZhong University]
+ */
+
+#include <iostream>
+#include <comm/masterserver.hpp>
+#include <comm/machine.hpp>
+#include <stdlib.h>
+#include <errno.h>
+#include <string.h>
+#include <sys/types.h>
+#include <netinet/in.h>
+#include <sys/socket.h>
+#include <sys/wait.h>
+#include <arpa/inet.h>
+#include <assert.h>
+#include <pthread.h>
+#include "graphchi_basic_includes.hpp"
+
+using namespace xGraph;
+using namespace graphchi;
+
+typedef float EdgeDataType;
+
+int main(int argc, const char **argv) {
+	int M;
+	task t1;
+	char *buf;
+	runcontrol runc; 	//Control the Intervals to run
+	char Phead[6];
+
+	std::vector<std::pair<int, std::string> > hosts;
+	std::vector<task> Tc;
+	std::cout<<"Today,begin...,2014/3/24"<<std::endl;
+
+	graphchi_init(argc, argv);
+	/* determine the number of workers */
+    	int machines = get_option_int("machines", 20); //get_option_int
+	M = determine_machines("/home/xGraph/conf/hosts.slave", machines, &hosts);
+	for(unsigned int i=0;i<=hosts.size()-1;i++)
+            std::cout<<hosts[i].first<<" "<<hosts[i].second.c_str()<<std::endl;
+	std::cout<<M<<std::endl;
+
+
+    	/* Process input file - if not already preprocessed */
+    	std::string filename = get_option_string("file"); // Base filename  src/util/cmdopts.hpp
+    	int niters = get_option_int("niters", 4); //get_option_int
+    	int nshards = convert_if_notexists<EdgeDataType>(filename, get_option_string("nshards", "auto"));
+	if(nshards < M) M = nshards; //in-memory computing
+
+	/* start a server for workers */
+        pthread_t ts;
+	int socket;
+        int ret = pthread_create(&ts, NULL, &server, &runc);
+        assert(ret>=0);
+
+	/* Assign tasks for workers*/
+	/* 用全局变量NND*/
+	T = (task*)malloc(sizeof(task) * nshards * niters);
+	int k = 0;
+	for(int i = 0; i < niters; i++) {
+		for(int j = 0; j < nshards; j++) {
+			if((k % M) == 0) k = 0;
+			t1.machine = k;
+			t1.iter = i;
+			t1.interval = j;
+			T[i * nshards + j] = t1;
+			//Tc.push_back(t1);
+			//std::cout<<k<<std::endl;
+			k ++;
+		}
+	}
+
+	for(int i = 0; i < M; i++) {
+		Tc.clear();
+		for(int j = 0; j < niters * nshards; j ++) {
+			if(T[j].machine == i) Tc.push_back(T[j]);
+		}
+		//for(int j = 0; j < Tc.size(); j++) std::cout<<Tc[j].machine<<" "<<Tc[j].iter<<" "<<Tc[j].interval<<std::endl;
+		int len = 6 + sizeof(int) + sizeof(task)*Tc.size();
+		buf = (char*)malloc(len);
+		memcpy(buf,"XGREQS",6); //package 'S'=schedule
+		
+		int c;
+		c = Tc.size();
+		memcpy(buf + 6,(void*)&c,sizeof(int)); //package 'S'=schedule
+		for(unsigned int j = 0; j < Tc.size(); j++) memcpy((void*)(buf+6+sizeof(int)+j*sizeof(task)),(void*)&(Tc[j]),sizeof(task));
+		for(unsigned int j = 0; j < Tc.size(); j++) std::cout<<((task*)(buf+6+sizeof(int)+j*sizeof(task)))->machine<<" " \
+                                                        <<((task*)(buf+6+sizeof(int)+j*sizeof(task)))->iter<<" "<<((task*)(buf+6+sizeof(int)+j*sizeof(task)))->interval<<std::endl;
+		int wret=write(hosts[i].first ,buf, len);
+		if(wret != len){
+			std::cout<<"Send Schedule Message to "<<hosts[i].second<< "Fail!"<<std::endl;
+		}
+		int recvbytes;
+                if ((recvbytes = recv(hosts[i].first, buf, 1024,0)) == -1) {
+                        std::cout<<"recv error!"<<std::endl;
+                }
+		assert(recvbytes != -1);
+		char Phead[6];
+		memcpy(Phead, buf, 6);
+        	if(strcmp(Phead,"XGACKS")!=0){
+                	std::cout<<"Recv Package S Fail:"<<hosts[i].second<<std::endl;
+			assert(false);
+        	}
+		std::cout<<*((int*)(buf+6))<<Phead<<std::endl;
+	}
+
+	/*
+	 * Section: Begin to Schedule.
+     	 */
+	windowpos = 0;
+	intervals = k;
+	runc.T = T;
+	for(int i = 0; i < M; i ++) {
+		int wret=write(hosts[i].first ,(char*)"XGREQB", 6); //'B' Package is Demand workers to run.
+                if(wret != 6){
+                        std::cout<<"Send Schedule Message to "<<hosts[i].second<< "Fail!"<<std::endl;
+                }
+                int recvbytes;
+                if ((recvbytes = recv(hosts[i].first, buf, 6,0)) == -1) {
+                        std::cout<<"recv error!"<<std::endl;
+                }
+                assert(recvbytes != -1);		
+		memcpy(Phead,buf,6);
+		if(strcmp(Phead, "XGACKB") != 0) std::cout<<"recv Package B error!"<<std::endl;
+	}	
+	
+        std::cout<<"Tasks have been launched!"<<std::endl;
+	
+/*
+	for(int i = 0; i < k; i ++) {
+		std::cout<<"step1...."<<std::endl;
+		recv(hosts[i].first, buf, 6,0);
+		std::cout<<"step2...."<<std::endl;
+		std::cout<<buf<<std::endl;
+		if(i < k -1){
+		std::cout<<"step3...."<<std::endl;
+			write(hosts[T[i+1].machine].first ,(char*)"XGREQN", 6); 	
+		
+		std::cout<<"step4...."<<std::endl;
+		}
+	}
+*/
+	while(1){}	
+	/* close clients connect.*/
+        for(unsigned int i=0;i<=hosts.size()-1;i++)
+            close(hosts[i].first);
+        std::cout<<M<<std::endl;
+	/* close server.*/
+	close(socket);
+}
